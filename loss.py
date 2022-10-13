@@ -11,6 +11,7 @@ from typing import Callable, Mapping, Optional, Tuple, Union
 
 import torch
 from torch import nn
+import numpy as np
 
 
 class AlignmentLoss(nn.Module):
@@ -19,9 +20,9 @@ class AlignmentLoss(nn.Module):
         self,
         num_tokens: int,
         del_cost: Optional[float] = 1.0,
-        loss_reg: Optional[float] = 1.0,
+        loss_reg: Optional[float] = None, #TODO change to 1.0
         width: Optional[int] = None,
-        reduction: Optional[str] = 'mean',
+        reduction: Optional[str] = 'sum',
         pad_token: Optional[int] = 1,
         *args, 
         **kwargs
@@ -56,19 +57,25 @@ class AlignmentLoss(nn.Module):
             A torch.Tensor with the value of the loss
         """
 
+        if isinstance(y_pred, np.ndarray):
+            y_pred = torch.from_numpy(y_pred)
+        if isinstance(y_true, np.ndarray):
+            y_true = torch.from_numpy(y_true)
+
         dtype = y_pred.dtype
-        inf = torch.Tensor([1e9], dtype = dtype)
+        inf = torch.tensor([1e9], dtype = dtype)
 
         y_true, seq_lens = self.preprocess_y_true(y_true)
         y_pred = self.preprocess_y_pred(y_pred)
 
         subs_costs = self.xentropy_subs_cost_fn(y_true, y_pred)
         ins_costs = self.xentropy_ins_cost_fn(y_pred)
-        del_cost = torch.Tensor([self.del_cost], dtype)
+        del_cost = torch.tensor([self.del_cost], dtype = dtype)
 
         if self.width is None:
             loss = self.alignment(subs_costs, ins_costs, del_cost, seq_lens, inf, dtype)
         else:
+            raise NotImplementedError
             loss = self.banded_alignment(subs_costs, ins_costs, del_cost, seq_lens, inf, dtype)
         
         if self.reduction == 'none':
@@ -80,7 +87,6 @@ class AlignmentLoss(nn.Module):
 
         return loss
 
-    @staticmethod
     def preprocess_y_true(
         self,
         y_true: torch.Tensor,
@@ -164,7 +170,7 @@ class AlignmentLoss(nn.Module):
         """
 
         y_pred = torch.clamp(y_pred, min = eps, max = 1 - eps)
-        y_true, y_pred = torch.expand(y_true, 2), torch.expand(y_pred, 1)
+        y_true, y_pred = y_true.unsqueeze(2), y_pred.unsqueeze(1)
         return -torch.sum(torch.xlogy(y_true, y_pred), dim =-1)
 
     def xentropy_ins_cost_fn(
@@ -183,7 +189,118 @@ class AlignmentLoss(nn.Module):
             cross-entropy loss between gap token and y_pred[b][l].
         """
 
-        ins_scores = torch.clamp(y_pred[:, self.gap_token], min = eps, max = 1 - eps)
+        ins_scores = torch.clamp(y_pred[..., self.pad_token], min = eps, max = 1 - eps)
         return -torch.log(ins_scores)
 
+    def alignment(self, subs_costs, ins_costs, del_cost, seq_lens, inf, dtype):
+        """Computes the alignment score values.
+        Args:
+            subs_costs: A tf.Tensor<float>[batch, len_1, len_2] input matrix of
+            substitution costs.
+            ins_costs: A tf.Tensor<float>[batch, len_1] input vector of insertion
+            costs.
+            del_cost: A float, the cost of deletion.
+            seq_lens: A tf.Tensor<int>[batch] input matrix of true sequence lengths.
+            inf: A float with very high value.
+            dtype: the data type of y_pred
+        Returns:
+            A tf.Tensor<float>[batch] of values of the alignment scores.
+        """
+        # Gathers shape variables.
+        shape = subs_costs.shape
+        b, m, n = shape[0], shape[1], shape[2]
+        # Computes and rearranges cost tensors for vectorized wavefront iterations.
+        subs_costs = self.wavefrontify(subs_costs)
+        ins_costs = self.wavefrontify_vec(ins_costs, m + 1)
 
+        # TODO
+        # Sets up reduction operators.
+        if self.loss_reg is None:
+            minop = lambda t: torch.min(t, 0)
+        else:
+            raise NotImplementedError()
+            loss_reg = tf.convert_to_tensor(self.loss_reg, dtype)
+            minop = lambda t: -loss_reg * tf.reduce_logsumexp(-t / loss_reg, 0)
+
+        # Initializes recursion.
+        v_opt = torch.full(size = (b, ), fill_value=inf.item())
+        v_p2 = torch.concat([torch.zeros((1, b)), torch.full((m-1, b), inf.item())])
+        v_p1 = torch.concat([
+            ins_costs[0][:b-1],
+            torch.full((1, b), del_cost.item()),
+            torch.full((m-1, b), inf.item())
+        ])
+
+        i_range = torch.arange(m + 1, dtype=int)
+        k_end = seq_lens + n  # Indexes antidiagonal containing last entry, w/o pad.
+        # Indexes last entries in "wavefrontified" slices, accounting for padding.
+        nd_indices = torch.stack([seq_lens, torch.arange(b, dtype=int)], -1)
+
+        # Runs forward recursion.
+        for k in torch.arange(2, m + n + 1):
+            
+            # Masks invalid entries in "wavefrontified" value tensor.
+            j_range = k - i_range
+            inv_mask = torch.logical_and(j_range >= 0, j_range <= n).unsqueeze(-1)
+            
+            o_m = v_p2 + subs_costs[k - 2]  # [m, b]
+            o_i = v_p1 + ins_costs[k - 1]  # [m + 1, b]
+            v_p2 = v_p1[:-1]
+            o_d = v_p2 + del_cost  # [m, b]
+            
+            v_p1 = torch.concat(
+                [o_i[:b-1][:],
+                minop(torch.stack([o_m, o_i[1:], o_d]))[0]], 0)
+            v_p1 = torch.where(inv_mask, v_p1, inf)
+            v_opt = torch.where(k_end == k, v_p1[list(nd_indices.T)], v_opt)
+
+        return v_opt
+
+    def wavefrontify(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Rearranges batch of input 2D tensors for vectorized wavefront algorithm.
+        Args:
+            tensor: A torch.Tensor [batch, len1, len2].
+        Returns:
+            A single torch.Tensor [len1 + len2 - 1, len1, batch] satisfying
+            out[k][i][n] = t[n][i][k - i]
+            if the RHS is well-defined, and 0 otherwise.
+            In other words, for each len1 x len2 matrix t[n], out[..., n] is a
+            (len1 + len2 - 1) x len1 matrix whose rows correspond to antidiagonals of
+            t[n].
+        """
+        
+        # b, l1, l2 = tf.shape(tensor)[0], tf.shape(tensor)[1], tf.shape(tensor)[2]
+        shape = tensor.shape
+        b, l1, l2 = shape[0], shape[1], shape[2]
+        # n_pad, padded_len = l1 - 1, l1 + l2 - 1
+        n_pad, padded_len = l1 - 1, l1 + l2 - 1
+        # ta = tf.TensorArray(tensor.dtype, size=l1, clear_after_read=True)
+        ta = torch.zeros((l1, b, padded_len), dtype=tensor.dtype)
+        for i in range(l1):
+            row_i = tensor[:, i, :]
+            row_i = torch.nn.functional.pad(row_i, [n_pad, n_pad])
+            row_i = row_i[:, n_pad-i:-i+row_i.shape[1]]
+            ta[i, ...] = row_i
+
+        return ta.permute(2, 0, 1) # out[padded_len, l1, b]
+
+    def wavefrontify_vec(self, tensor: torch.Tensor, len1: int) -> torch.Tensor:
+        """Rearranges batch of 1D input tensors for vectorized wavefront algorithm.
+        Args:
+            tensor: A torch.Tensor[batch, len2].
+            len1: An integer corresponding to the length of y_true plus one.
+        Returns:
+            A single torch.Tensor[len1 + len2 - 1, len1, batch] satisfying
+            out[k][i][n] = t[n][k - i]
+            if the RHS is well-defined, and 0 otherwise.
+        """
+        shape = tensor.shape
+        b, len2 = shape[0], shape[1]
+        n_pad, padded_len = len1 - 1, len1 + len2 - 1
+
+        ta = torch.zeros((len1, b, padded_len))
+        for i in range(len1):
+            row_i = torch.nn.functional.pad(tensor, [n_pad, n_pad])
+            row_i = row_i[:, n_pad-i:-i+row_i.shape[1]]
+            ta[i, ...] = row_i
+        return ta.permute(2, 0, 1) # out[padded_len, len1, b]
