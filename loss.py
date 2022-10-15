@@ -7,14 +7,33 @@ loss function corresponds to the team that developed DeepConensus
 https://github.com/google/deepconsensus
 """
 
-from typing import Callable, Mapping, Optional, Tuple, Union
+from typing import Optional, Tuple
 
 import torch
 from torch import nn
-import numpy as np
 
+GAP_OR_PAD = ' '
+ALLOWED_BASES = 'ATCG'
+VOCAB = GAP_OR_PAD + ALLOWED_BASES
+
+# Value used to fill in empty rows in the tf.Examples.
+GAP_OR_PAD_INT = VOCAB.index(GAP_OR_PAD)
 
 class AlignmentLoss(nn.Module):
+    """
+    PyTorch implementation of the alignment loss used in DeepConsensus 0.3
+
+    Args:
+        num_tokens (int): number of possible outcomes, for DNA alignment you
+            should use 5 (4 bases +  gap token).
+        del_cost (float): penalty for deletions
+        loss_reg (float): Regularization strength. 
+            Set to None to disable regularization (compute hard alignments).
+        width (int): The width of the alignement path. 
+            Set to None to remove this constraint.
+        reduction (str): how to reduce the loss of all the samples in the batch.
+        pad_token (int): index used for padding.
+    """
 
     def __init__(
         self,
@@ -22,8 +41,8 @@ class AlignmentLoss(nn.Module):
         del_cost: Optional[float] = 1.0,
         loss_reg: Optional[float] = None, #TODO change to 1.0
         width: Optional[int] = None,
-        reduction: Optional[str] = 'sum',
-        pad_token: Optional[int] = 1,
+        reduction: Optional[str] = 'mean',
+        pad_token: Optional[int] = GAP_OR_PAD_INT,
         *args, 
         **kwargs
         ):
@@ -56,11 +75,6 @@ class AlignmentLoss(nn.Module):
         Returns:
             A torch.Tensor with the value of the loss
         """
-
-        if isinstance(y_pred, np.ndarray):
-            y_pred = torch.from_numpy(y_pred)
-        if isinstance(y_true, np.ndarray):
-            y_true = torch.from_numpy(y_true)
 
         dtype = y_pred.dtype
         inf = torch.tensor([1e9], dtype = dtype)
@@ -213,20 +227,18 @@ class AlignmentLoss(nn.Module):
         subs_costs = self.wavefrontify(subs_costs)
         ins_costs = self.wavefrontify_vec(ins_costs, m + 1)
 
-        # TODO
         # Sets up reduction operators.
         if self.loss_reg is None:
             minop = lambda t: torch.min(t, 0)
         else:
-            raise NotImplementedError()
-            loss_reg = tf.convert_to_tensor(self.loss_reg, dtype)
-            minop = lambda t: -loss_reg * tf.reduce_logsumexp(-t / loss_reg, 0)
+            loss_reg = torch.tensor(self.loss_reg, dtype = dtype)
+            minop = lambda t: -loss_reg * torch.logsumexp(-t / loss_reg, dim = 0)
 
         # Initializes recursion.
         v_opt = torch.full(size = (b, ), fill_value=inf.item())
         v_p2 = torch.concat([torch.zeros((1, b)), torch.full((m-1, b), inf.item())])
         v_p1 = torch.concat([
-            ins_costs[0][:b-1],
+            ins_costs[0, 0:1, 0:b],
             torch.full((1, b), del_cost.item()),
             torch.full((m-1, b), inf.item())
         ])
@@ -249,7 +261,7 @@ class AlignmentLoss(nn.Module):
             o_d = v_p2 + del_cost  # [m, b]
             
             v_p1 = torch.concat(
-                [o_i[:b-1][:],
+                [o_i[0:1, 0:b],
                 minop(torch.stack([o_m, o_i[1:], o_d]))[0]], 0)
             v_p1 = torch.where(inv_mask, v_p1, inf)
             v_opt = torch.where(k_end == k, v_p1[list(nd_indices.T)], v_opt)
